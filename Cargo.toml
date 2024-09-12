@@ -1,10 +1,13 @@
-[package]
-name = "rustraft"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+    "local-cluster",
+    "raft",
+]
+resolver = "2"
 
-[dependencies]
-ahash = "0.8.11"
-color-eyre = "0.6.3"
-rand = "0.8.5"
-tokio = { version = "1", features = ["full"] }
+[workspace.dependencies]
+ahash = "0.8"
+color-eyre = "0.6"
+console-subscriber = "0.4"
+rand = "0.8"
+tokio = "1.40"

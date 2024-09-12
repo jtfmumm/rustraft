@@ -1,0 +1,9 @@
+[package]
+name = "rustraft-raft"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ahash = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["full", "tracing"] }
