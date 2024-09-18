@@ -5,7 +5,10 @@ use std::{
     time::Duration,
     iter::zip,
 };
-use tokio::{sync::{mpsc, oneshot}, time::{self, Instant}};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::{self, Instant}
+};
 
 pub mod msg;
 
@@ -30,17 +33,21 @@ pub enum RaftState {
     },
 }
 
-// Implementation of Raft protocol.
+/// Implementation of Raft protocol.
+#[derive(Debug)]
 pub struct RaftNode {
-    pub id: NodeId,
+    id: NodeId,
     state: RaftState,
-    /// We currently assume membership goes from 0 to node_count - 1
+    /// We currently assume node ids go from 0 to node_count - 1
     node_count: u32,
     term: Term,
+    /// Log of client commands with corresponding terms.
+    /// The 0th entry is always a placeholder.
     log: Vec<(Term, RaftCmd)>,
-    /// Next timeout
+    /// Next timeout (election timeout for non-leaders and heartbeat
+    /// timeout for leader)
     next_timeout: Instant,
-    // index of highest log entry known to be committed
+    /// index of highest log entry known to be committed
     commit_idx: usize,
     // Channels
     /// RaftMsgs sent between Raft nodes
@@ -48,6 +55,7 @@ pub struct RaftNode {
     outgoing_network_tx: mpsc::Sender<(NodeId, RaftMsg)>,
     /// Cmds sent from client/s
     client_rx: mpsc::Receiver<RaftCmd>,
+    shutdown_rx: mpsc::Receiver<()>,
     /// Channel for testing
     summary_request_rx: mpsc::Receiver<oneshot::Sender<RaftNodeSummary>>,
 }
@@ -59,6 +67,7 @@ impl RaftNode {
         incoming_network_rx: mpsc::Receiver<RaftMsg>,
         outgoing_network_tx: mpsc::Sender<(NodeId, RaftMsg)>,
         client_rx: mpsc::Receiver<RaftCmd>,
+        shutdown_rx: mpsc::Receiver<()>,
         summary_request_rx: mpsc::Receiver<oneshot::Sender<RaftNodeSummary>>,
     ) -> Self {
         let mut node = Self {
@@ -66,13 +75,14 @@ impl RaftNode {
             state: RaftState::Follower,
             node_count,
             term: 0,
-            // The 0th entry is just a placeholder
+            // The 0th entry is always a placeholder
             log: vec![(0, 0)],
             next_timeout: Instant::now() + random_timeout(),
             commit_idx: 0,
             incoming_network_rx,
             outgoing_network_tx,
             client_rx,
+            shutdown_rx,
             summary_request_rx,
         };
         node.init();
@@ -100,7 +110,10 @@ impl RaftNode {
                     self.apply_cmd(cmd).await;
                 }
                 Some(oneshot_ch) = self.summary_request_rx.recv() => {
-                    oneshot_ch.send(self.get_state()).unwrap();
+                    oneshot_ch.send(self.state_summary()).unwrap();
+                }
+                _ = self.shutdown_rx.recv() => {
+                    return;
                 }
                 _ = sleep => {
                     self.handle_timeout().await;
@@ -109,6 +122,7 @@ impl RaftNode {
         }
     }
 
+    /// Apply client command
     async fn apply_cmd(&mut self, cmd: RaftCmd) {
         use RaftState::*;
         match &self.state {
@@ -121,24 +135,25 @@ impl RaftNode {
                 let prev_log_idx = self.commit_idx;
                 let prev_log_term = self.log[self.commit_idx].0;
                 let entries = vec![(self.term, cmd)];
+                let msg = self.create_append_entries(
+                    prev_log_idx,
+                    prev_log_term,
+                    entries.clone(),
+                );
                 for node_id in 0..self.node_count as usize {
                     if node_id == self.id {
                         continue;
                     }
-                    let msg = self.create_append_entries(
-                        prev_log_idx,
-                        prev_log_term,
-                        entries.clone(),
-                    );
-                    self.outgoing_network_tx.send((node_id, msg)).await.expect("Failed to send RaftMsg!");
+                    self.outgoing_network_tx.send((node_id, msg.clone())).await.expect("Failed to send RaftMsg!");
                 }
             }
             _ => {
-                println!("Received apply_cmd at non-leader! id {}", self.id);
+                println!("Received apply_cmd at non-leader: id {}", self.id);
             }
         }
     }
 
+    /// Receive Raft protocol message.
     async fn receive_message(&mut self, msg: RaftMsg) {
         use RaftMsg::*;
         match msg {
@@ -184,53 +199,46 @@ impl RaftNode {
         use RaftState::*;
         match &self.state {
             Candidate { .. } => {
+                // Election timeout: candidacy failed.
                 self.transition_to_follower();
             }
             Follower => {
+                // Election timeout: prepare to transition to candidate.
                 self.term += 1;
                 let last_log_idx = self.log.len() - 1;
                 let last_log_term = self.log[last_log_idx].0;
+                let msg = RaftMsg::RequestVote {
+                    term: self.term,
+                    candidate: self.id,
+                    last_log_idx,
+                    last_log_term,
+                };
                 for node_id in 0..self.node_count as usize {
                     if node_id == self.id {
                         continue;
                     }
-                    let msg = RaftMsg::RequestVote {
-                        term: self.term,
-                        candidate: self.id,
-                        last_log_idx,
-                        last_log_term,
-                    };
-                    self.outgoing_network_tx.send((node_id, msg)).await.expect("Failed to send RaftMsg!");
+                    self.outgoing_network_tx.send((node_id, msg.clone())).await.expect("Failed to send RaftMsg!");
                 }
                 self.transition_to_candidate();
             }
             Leader { .. } => {
+                // Heartbeat timeout: send empty AppendEntries heartbeat.
                 let prev_log_idx = self.commit_idx;
                 let prev_log_term = self.log[self.commit_idx].0;
                 let empty_entries = Vec::new();
+                let msg = self.create_append_entries(
+                    prev_log_idx,
+                    prev_log_term,
+                    empty_entries,
+                );
                 for node_id in 0..self.node_count as usize {
                     if node_id == self.id {
                         continue;
                     }
-                    let msg = self.create_append_entries(
-                        prev_log_idx,
-                        prev_log_term,
-                        empty_entries.clone(),
-                    );
-                    self.outgoing_network_tx.send((node_id, msg)).await.expect("Failed to send RaftMsg!");
+                    self.outgoing_network_tx.send((node_id, msg.clone())).await.expect("Failed to send RaftMsg!");
                 }
                 self.next_timeout = Instant::now() + HEARTBEAT_DURATION;
             }
-        }
-    }
-
-    pub fn get_state(&self) -> RaftNodeSummary {
-        RaftNodeSummary {
-            id: self.id,
-            term: self.term,
-            is_leader: matches!(self.state, RaftState::Leader { .. }),
-            commit_idx: self.commit_idx,
-            log: self.log.clone(),
         }
     }
 
@@ -248,9 +256,7 @@ impl RaftNode {
         if term <= self.term {
             return;
         }
-
         self.term = term;
-
         let local_last_log_idx = self.log.len() - 1;
         let local_last_log_term = self.log[local_last_log_idx].0;
         let veto = last_log_term < local_last_log_term
@@ -271,6 +277,9 @@ impl RaftNode {
     }
 
     async fn receive_vote(&mut self, term: Term, voter: NodeId) {
+        if term != self.term {
+            return
+        }
         use RaftState::*;
         if let Candidate { ref mut votes } = &mut self.state {
             println!(
@@ -278,27 +287,25 @@ impl RaftNode {
                 self.id,
                 votes.len()
             );
-            if term == self.term {
-                votes.insert(voter);
-                if votes.len() > (self.node_count / 2) as usize {
-                    println!("{}: I'm leader with {} votes!", self.id, votes.len());
-                    self.transition_to_leader();
-                    // Any logs later than commit idx are no longer valid
-                    self.log.truncate(self.commit_idx + 1);
-                    let prev_log_idx = self.commit_idx;
-                    let prev_log_term = self.log[self.commit_idx].0;
-                    let entries = Vec::new();
-                    for node_id in 0..self.node_count as usize {
-                        if node_id == self.id {
-                            continue;
-                        }
-                        let msg = self.create_append_entries(
-                            prev_log_idx,
-                            prev_log_term,
-                            entries.clone(),
-                        );
-                        self.outgoing_network_tx.send((node_id, msg)).await.expect("Failed to send RaftMsg!");
+            votes.insert(voter);
+            if votes.len() > (self.node_count / 2) as usize {
+                println!("{} is leader with {} votes!", self.id, votes.len());
+                self.transition_to_leader();
+                // Any logs later than commit idx are no longer valid
+                self.log.truncate(self.commit_idx + 1);
+                let prev_log_idx = self.commit_idx;
+                let prev_log_term = self.log[self.commit_idx].0;
+                let entries = Vec::new();
+                let msg = self.create_append_entries(
+                    prev_log_idx,
+                    prev_log_term,
+                    entries,
+                );
+                for node_id in 0..self.node_count as usize {
+                    if node_id == self.id {
+                        continue;
                     }
+                    self.outgoing_network_tx.send((node_id, msg.clone())).await.expect("Failed to send RaftMsg!");
                 }
             }
         }
@@ -313,7 +320,7 @@ impl RaftNode {
         entries: Vec<(Term, RaftCmd)>,
         leader_commit_idx: usize,
     ) {
-        println!("{} receive_append_entries: {term} {leader}", self.id);
+        println!("{} receive_append_entries: term {term} leader {leader}", self.id);
         use RaftState::*;
         // First check if we need to transition to a follower.
         if term >= self.term && matches!(self.state, Candidate { .. } | Leader { .. }) {
@@ -322,57 +329,55 @@ impl RaftNode {
         }
         // Then check if we're a follower
         if matches!(self.state, Follower) {
-            if term >= self.term {
-                self.term = term;
-                if leader_commit_idx > self.commit_idx {
-                    // TODO: Should we be storing the leader commit idx or the more
-                    // optimistic prev_log_idx + entries.len()? I think the latter
-                    // is safe since followers never serve replies (and must agree
-                    // with a majority to be elected).
-                    self.commit_idx = leader_commit_idx
-                }
-                self.reset_timeout();
-
-                // Are we ready for this new list of entries?
-                if prev_log_idx >= self.log.len() || self.log[prev_log_idx].0 != prev_log_term {
-                    let msg = RaftMsg::AppendEntriesReply {
-                        commit_idx: self.commit_idx,
-                        term,
-                        replier: self.id,
-                        is_success: false,
-                    };
-                    self.outgoing_network_tx.send((leader, msg)).await.expect("Failed to send RaftMsg!");
-                    return;
-                }
-
-                if entries.is_empty() {
-                    return;
-                }
-                let start_idx = prev_log_idx + 1;
-                for (entry, idx) in zip(entries.clone(), start_idx..start_idx + entries.len()) {
-                    if idx == self.log.len() {
-                        self.log.push(entry);
-                    } else {
-                        self.log[idx] = entry;
-                    }
-                }
-                // The latest index at which the leader is trying to commit
-                let commit_idx = prev_log_idx + entries.len();
-                let msg = RaftMsg::AppendEntriesReply {
-                    commit_idx,
-                    term,
-                    replier: self.id,
-                    is_success: true,
-                };
-                self.outgoing_network_tx.send((leader, msg)).await.expect("Failed to send RaftMsg!");
-                /////////////////////////
-            } else {
+            if term < self.term {
                 let msg = RaftMsg::OutdatedTerm {
                     outdated_term: term,
                     current_term: self.term,
                 };
                 self.outgoing_network_tx.send((leader, msg)).await.expect("Failed to send RaftMsg!");
+                return;
             }
+
+            self.term = term;
+            self.reset_timeout();
+
+            // Are we ready for this new list of entries?
+            if prev_log_idx >= self.log.len() || self.log[prev_log_idx].0 != prev_log_term {
+                let msg = RaftMsg::AppendEntriesReply {
+                    commit_idx: self.commit_idx,
+                    term,
+                    replier: self.id,
+                    is_success: false,
+                };
+                self.outgoing_network_tx.send((leader, msg)).await.expect("Failed to send RaftMsg!");
+                return;
+            }
+            if leader_commit_idx > self.commit_idx {
+                self.commit_idx = leader_commit_idx
+            }
+
+            if entries.is_empty() {
+                return;
+            }
+            // Overwrite any idxs that are already filled and then start pushing
+            // new values.
+            let start_idx = prev_log_idx + 1;
+            for (entry, idx) in zip(entries.clone(), start_idx..start_idx + entries.len()) {
+                if idx == self.log.len() {
+                    self.log.push(entry);
+                } else {
+                    self.log[idx] = entry;
+                }
+            }
+            // The latest index at which the leader is trying to commit
+            let commit_idx = prev_log_idx + entries.len();
+            let msg = RaftMsg::AppendEntriesReply {
+                commit_idx,
+                term,
+                replier: self.id,
+                is_success: true,
+            };
+            self.outgoing_network_tx.send((leader, msg)).await.expect("Failed to send RaftMsg!");
         }
     }
 
@@ -387,6 +392,9 @@ impl RaftNode {
             "{} receive_append_entries: term {term} from {replier}, is_success: {is_success}",
             self.id
         );
+        if term != self.term {
+            return;
+        }
         if let RaftState::Leader {
             next_idxs,
             ref mut match_idxs,
@@ -407,9 +415,11 @@ impl RaftNode {
                     }
                 }
             } else {
+                // This follower wasn't ready for the entries we sent.
+                // We need to decrement the prev idx and send an earlier entry
+                // as well.
                 let old_next_idx = next_idxs.get(&replier).unwrap();
-                // TODO: Is this the right way to handle this?
-                // This indicates we are an outdated leader.
+                // This indicates we have been negotiating with an outdated leader.
                 if *old_next_idx <= 1 {
                     return;
                 }
@@ -446,14 +456,6 @@ impl RaftNode {
         self.next_timeout = Instant::now() + random_timeout();
     }
 
-    // TODO: Provide implementation of persistent store to struct
-    // fn write_log(&self) {
-    // }
-
-    // TODO: Provide implementation of persistent store to struct
-    // fn restore_from_log(&mut self) {
-    // }
-
     fn transition_to_candidate(&mut self) {
         let mut votes = HashSet::new();
         votes.insert(self.id);
@@ -478,6 +480,16 @@ impl RaftNode {
             next_idxs,
             match_idxs,
         };
+    }
+
+    fn state_summary(&self) -> RaftNodeSummary {
+        RaftNodeSummary {
+            id: self.id,
+            term: self.term,
+            is_leader: matches!(self.state, RaftState::Leader { .. }),
+            commit_idx: self.commit_idx,
+            log: self.log.clone(),
+        }
     }
 
     fn create_append_entries(

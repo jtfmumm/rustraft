@@ -7,6 +7,9 @@ use crate::Cluster;
 
 pub type Nodes = Vec<LocalNodeSummary>;
 
+/// Used for running tests against a Cluster simulation.
+/// Send client commands and check cluster state.
+#[derive(Debug)]
 pub struct LocalClusterRunner {
     node_count: u32,
     tx: mpsc::Sender<CtlMsg>,
@@ -17,9 +20,9 @@ impl LocalClusterRunner {
     pub fn new(node_count: u32) -> Self {
         let (requests_tx, requests_rx) = mpsc::channel(1024);
         let (replies_tx, replies_rx) = mpsc::channel(1024);
-        let mut c = Cluster::new(node_count, requests_rx, replies_tx);
+        let mut cluster = Cluster::new(node_count, requests_rx, replies_tx);
         tokio::spawn(async move {
-            c.run().await;
+            cluster.run().await;
         });
         Self {
             node_count,
@@ -57,7 +60,8 @@ impl LocalClusterRunner {
             .expect("Failed to send Disconnect");
     }
 
-    // Only one leader at the highest term
+    /// Check if there is only one leader at the highest term.
+    /// If so, return its state summary. Otherwise return an Error.
     pub async fn check_one_leader(&mut self) -> Result<LocalNodeSummary, color_eyre::eyre::Error> {
         let iterations = 40;
         for _ in 0..iterations {
@@ -73,6 +77,7 @@ impl LocalClusterRunner {
         bail!("No leader elected in time!")
     }
 
+    /// Send a client command to a node in the cluster.
     pub async fn send_cmd(&mut self, dest: NodeId, cmd: RaftCmd) {
         self.tx
             .send(CtlMsg::SendCmd { dest, cmd })
@@ -80,6 +85,7 @@ impl LocalClusterRunner {
             .expect("Failed to send SendCmd");
     }
 
+    /// Try to commit a new client command. Return true if successful, false otherwise.
     pub async fn try_to_commit(&mut self, cmd: RaftCmd) -> Result<bool, color_eyre::eyre::Error> {
         let Ok(leader) = self.check_one_leader().await else {
             bail!("No single leader!");
@@ -109,6 +115,8 @@ impl LocalClusterRunner {
         Ok(false)
     }
 
+    /// Return the number of nodes that have committed up to at least
+    /// the provided commit index.
     pub async fn n_committed(&mut self, commit_idx: usize) -> u32 {
         let mut count = 0;
         for node in &self.get_cluster_state().await {
@@ -119,10 +127,10 @@ impl LocalClusterRunner {
         count
     }
 
-    pub async fn is_highest_committed(&mut self, n: usize) -> bool {
+    pub async fn is_highest_committed(&mut self, commit_idx: usize) -> bool {
         let mut count = 0;
         for node in &self.get_cluster_state().await {
-            if node.raft.commit_idx == n {
+            if node.raft.commit_idx == commit_idx {
                 count += 1
             }
         }
@@ -145,6 +153,7 @@ impl LocalClusterRunner {
         term
     }
 
+    /// Check if all live and connected nodes agree on the current term.
     pub async fn live_term_agreement(&mut self) -> bool {
         let nodes = &self.get_cluster_state().await;
         if nodes.len() <= 1 {
@@ -174,10 +183,16 @@ impl Drop for LocalClusterRunner {
     }
 }
 
+/// Return count of nodes that are in the leader state for the current term.
+/// (This should always be 0 or 1 unless there's a bug in the protocol
+/// implementation.)
 fn leader_count(nodes: &Nodes) -> u32 {
     leaders(nodes).len() as u32
 }
 
+/// Return all nodes that are in the leader state for the current term.
+/// (There should only be 0 or 1 unless there's a bug in the protocol
+/// implementation.)
 fn leaders(nodes: &Nodes) -> Vec<LocalNodeSummary> {
     let mut highest_term = 0;
     let mut highest_leaders = Vec::new();

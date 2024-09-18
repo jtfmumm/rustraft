@@ -8,7 +8,7 @@ pub const HEARTBEAT_DURATION: Duration = Duration::from_millis(150);
 pub const ELECTION_TIMEOUT_MS_LOW: u64 = 500;
 pub const ELECTION_TIMEOUT_MS_HIGH: u64 = 1000;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RaftMsg {
     RequestVote {
         term: Term,

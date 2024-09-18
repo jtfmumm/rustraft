@@ -5,13 +5,18 @@ use rustraft_raft::{
     RaftNode,
 };
 
+/// Messages sent from cluster simulator to LocalNode
+#[derive(Debug)]
 pub enum LocalNodeMsg {
+    /// Client commands
     Cmd {
         cmd: RaftCmd,
     },
+    /// Raft protocol messages
     Msg {
         msg: RaftMsg,
     },
+    /// For testing purposes, requests a state summary
     SummaryRequest {
         tx: oneshot::Sender<LocalNodeSummary>,
     },
@@ -22,11 +27,13 @@ pub enum LocalNodeMsg {
     Shutdown,
 }
 
-/// Simulates a node on a network but run locally.
+/// Simulates a node on a network but run locally. Spins up a corresponding
+/// RaftNode in a tokio task and communicates to it via channels.
+#[derive(Debug)]
 pub struct LocalNode {
-    pub id: NodeId,
-    pub is_disconnected: bool,
-    pub is_dead: bool,
+    id: NodeId,
+    is_disconnected: bool,
+    is_dead: bool,
     /// Channels for communicating with network
     incoming_rx: mpsc::Receiver<LocalNodeMsg>,
     outgoing_tx: mpsc::Sender<(NodeId, RaftMsg)>,
@@ -34,6 +41,7 @@ pub struct LocalNode {
     raft_incoming_network_tx: mpsc::Sender<RaftMsg>,
     raft_outgoing_network_rx: mpsc::Receiver<(NodeId, RaftMsg)>,
     raft_client_tx: mpsc::Sender<RaftCmd>,
+    raft_shutdown_tx: mpsc::Sender<()>,
     /// Channel for testing
     raft_summary_request_tx: mpsc::Sender<oneshot::Sender<RaftNodeSummary>>,
 }
@@ -49,6 +57,7 @@ impl LocalNode {
         let (raft_outgoing_network_tx, raft_outgoing_network_rx) = mpsc::channel(1024);
         let (raft_client_tx, raft_client_rx) = mpsc::channel(1024);
         let (raft_summary_request_tx, raft_summary_request_rx) = mpsc::channel(1024);
+        let (raft_shutdown_tx, raft_shutdown_rx) = mpsc::channel(1);
 
         tokio::spawn(async move {
             let mut raft_node = RaftNode::new(
@@ -57,6 +66,7 @@ impl LocalNode {
                 raft_incoming_network_rx,
                 raft_outgoing_network_tx,
                 raft_client_rx,
+                raft_shutdown_rx,
                 raft_summary_request_rx,
             );
             raft_node.run().await;
@@ -71,6 +81,7 @@ impl LocalNode {
             raft_incoming_network_tx,
             raft_outgoing_network_rx,
             raft_client_tx,
+            raft_shutdown_tx,
             raft_summary_request_tx,
         }
     }
@@ -102,7 +113,10 @@ impl LocalNode {
                         Start => self.start(),
                         Disconnect => self.disconnect(),
                         Connect => self.connect(),
-                        Shutdown => break,
+                        Shutdown => {
+                            self.raft_shutdown_tx.send(()).await.unwrap();
+                            break;
+                        },
                     }
                 }
                 Some((dest, msg)) = self.raft_outgoing_network_rx.recv() => {
@@ -111,12 +125,12 @@ impl LocalNode {
                     }
                     println!("{} to {}: Sending {:?}", self.id, dest, msg);
                     self.outgoing_tx.send((dest, msg)).await.unwrap();
-                    println!("--{}: Sent!", self.id);
                 }
             }
         }
     }
 
+    /// Apply client command
     async fn apply_cmd(&mut self, cmd: RaftCmd) {
         if self.is_dead {
             return;
@@ -127,6 +141,7 @@ impl LocalNode {
             .expect("Failed to forward RaftCmd");
     }
 
+    /// Receive Raft protocol message
     async fn receive_message(&mut self, msg: RaftMsg) {
         if self.is_dead || self.is_disconnected {
             return;

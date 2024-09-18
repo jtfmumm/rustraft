@@ -1,3 +1,7 @@
+//! Cluster simulates a cluster of Raft nodes.
+//! LocalNodes encapsulate the RaftNode implementations and
+//! manage simulated state like `is_dead` and `is_disconnected`.
+
 use ahash::{HashMap, HashMapExt};
 use local_node::LocalNodeMsg;
 use rustraft_raft::msg::Destinations;
@@ -7,12 +11,13 @@ use tokio::{
     time::{self, Duration, Instant},
 };
 
-pub mod local_cluster_tester;
+pub mod local_cluster_runner;
 pub mod local_node;
 
 use crate::local_node::LocalNode;
 use rustraft_raft::msg::{CtlMsg, NodeId, RaftMsg};
 
+#[derive(Debug)]
 pub struct Cluster {
     /// Channels for sending to individual nodes
     node_txs: HashMap<NodeId, mpsc::Sender<LocalNodeMsg>>,
